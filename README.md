@@ -24,14 +24,26 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o genflux ./cmd/genflux
 ./genflux pcap gen --file-count 1 --out-dir .
 ```
 
-示例 B：生成 5 个文件，控制起始时间与大小
+示例 A2：生成 1 个文件并指定文件名
+
+```
+./genflux pcap gen --file-count 1 --out-file ./my_traffic.pcap
+```
+
+示例 A4：使用带单位的精确大小（1024 进制）
+
+```
+./genflux pcap gen --file-count 1 --exact-size 1g --out-file ./my_1gb.pcap
+./genflux pcap gen --file-count 1 --exact-size 0.5g --out-file ./my_512mb.pcap
+```
+
+示例 B：生成 1 个文件并精确到指定大小（带单位）
 
 ```
 ./genflux pcap gen \
-  --file-count 5 \
-  --out-dir ./out \
-  --start-time \"2024-01-01T00:00:00Z\" \
-  --max-size 100000000
+  --file-count 1 \
+  --out-file ./out/my_5gb.pcap \
+  --exact-size 5g
 ```
 
 示例 C：生成固定 200 万条 5 元组流（每条 10 包）
@@ -42,7 +54,7 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o genflux ./cmd/genflux
   --packets-per-flow 10 \
   --internal-hosts 1000 \
   --external-hosts 1000 \
-  --max-size 1600000000 \
+  --exact-size 1.49g \
   --file-count 1 \
   --out-dir .
 ```
@@ -70,8 +82,9 @@ sudo ./genflux replay --in generated_0000.pcap --iface eth0 --mode mbps --mbps 2
 - `--max-duration`：最大时长（秒）。
 - `--file-count`：生成文件数量（>1 时文件名为 `generated_000000.pcap` 等）。
 - `--out-dir`：输出目录。
+- `--out-file`：输出文件路径（要求 `--file-count 1`）。
 - `--start-time`：开始时间（RFC3339 或 `Mon Jan 2 15:04:05 2006`）。
-- `--max-size`：单文件最大字节数（用于控制总包数上限）。
+- `--exact-size`：精确输出到指定大小（如 `1g`、`0.5gb`；1024 进制，要求 `--file-count 1`）。
 - `--seed`：随机种子（int64），用于复现实验结果。
 
 ### 2) 回放 pcap（AF_PACKET）
@@ -129,5 +142,5 @@ sudo ./genflux replay --in input.pcap --iface eth0 --mode pps --pps 50000
 
 200mbps 无限打
   sudo ./genflux replay --in generated_0000.pcap --iface eth4 --mode mbps --mbps 200 --loop 0
-约 200MB 的 pcap，循环时单次更长
-  ./genflux pcap gen --file-count 1 --out-dir . --max-size 200000000 --min-duration 60 --max-duration 60
+约 200MB 的 pcap（按 1024 进制），循环时单次更长
+  ./genflux pcap gen --file-count 1 --out-dir . --exact-size 200m --min-duration 60 --max-duration 60

@@ -22,8 +22,10 @@ type Config struct {
 	MaxDuration    time.Duration
 	FileCount      int
 	OutDir         string
+	OutFile        string
 	StartTime      time.Time
 	MaxSizeBytes   int
+	ExactBytes     int
 	Seed           int64
 	FlowCount      int
 	PacketsPerFlow int
@@ -38,8 +40,10 @@ func DefaultConfig() Config {
 		MaxDuration:    120 * time.Second,
 		FileCount:      1,
 		OutDir:         ".",
+		OutFile:        "",
 		StartTime:      start,
 		MaxSizeBytes:   300000000,
+		ExactBytes:     0,
 		Seed:           time.Now().UnixNano(),
 		FlowCount:      0,
 		PacketsPerFlow: 2,
@@ -58,11 +62,17 @@ func Generate(cfg Config) error {
 	if cfg.FileCount <= 0 {
 		return errors.New("file-count must be > 0")
 	}
+	if cfg.OutFile != "" && cfg.FileCount != 1 {
+		return errors.New("out-file requires file-count=1")
+	}
+	if cfg.ExactBytes > 0 && cfg.FileCount != 1 {
+		return errors.New("exact-size requires file-count=1")
+	}
 	if cfg.MinDuration <= 0 || cfg.MaxDuration <= 0 || cfg.MaxDuration < cfg.MinDuration {
 		return errors.New("invalid duration range")
 	}
-	if cfg.MaxSizeBytes <= 0 {
-		return errors.New("max-size must be > 0")
+	if cfg.ExactBytes <= 0 {
+		return errors.New("exact-size must be > 0")
 	}
 	if cfg.FlowCount < 0 {
 		return errors.New("flow-count must be >= 0")
@@ -99,11 +109,14 @@ func Generate(cfg Config) error {
 
 	startTime := cfg.StartTime
 	for i := 0; i < cfg.FileCount; i++ {
-		name := "generated_0000.pcap"
-		if cfg.FileCount > 1 {
-			name = fmt.Sprintf("generated_%06d.pcap", i)
+		path := cfg.OutFile
+		if path == "" {
+			name := "generated_0000.pcap"
+			if cfg.FileCount > 1 {
+				name = fmt.Sprintf("generated_%06d.pcap", i)
+			}
+			path = filepath.Join(cfg.OutDir, name)
 		}
-		path := filepath.Join(cfg.OutDir, name)
 
 		dur := randomDuration(randSrc, cfg.MinDuration, cfg.MaxDuration)
 		if cfg.FileCount > 1 {
@@ -116,11 +129,11 @@ func Generate(cfg Config) error {
 		}
 
 		if cfg.FlowCount > 0 {
-			if err := createPcapFileFlows(path, startTime, dur, cfg, internal, external); err != nil {
+			if err := createPcapFileFlows(path, startTime, dur, cfg, cfg.ExactBytes, randSrc, internal, external); err != nil {
 				return err
 			}
 		} else {
-			if err := createPcapFile(path, startTime, dur, cfg.MaxSizeBytes, randSrc, internal, external); err != nil {
+			if err := createPcapFile(path, startTime, dur, cfg.MaxSizeBytes, cfg.ExactBytes, randSrc, internal, external); err != nil {
 				return err
 			}
 		}
@@ -129,7 +142,7 @@ func Generate(cfg Config) error {
 	return nil
 }
 
-func createPcapFileFlows(path string, start time.Time, duration time.Duration, cfg Config, internal, external []host) error {
+func createPcapFileFlows(path string, start time.Time, duration time.Duration, cfg Config, exactBytes int, randSrc *rand.Rand, internal, external []host) error {
 	log.Printf("Creating %s flows=%d packetsPerFlow=%d duration=%s", path, cfg.FlowCount, cfg.PacketsPerFlow, duration)
 
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -151,9 +164,15 @@ func createPcapFileFlows(path string, start time.Time, duration time.Duration, c
 		return fmt.Errorf("flow-count exceeds capacity: flow-count=%d max=%d (2*internal*external)", cfg.FlowCount, totalCapacity)
 	}
 	totalPackets := cfg.FlowCount * cfg.PacketsPerFlow
-	estimatedSize := 24 + totalPackets*78
-	if cfg.MaxSizeBytes > 0 && estimatedSize > cfg.MaxSizeBytes {
-		return fmt.Errorf("estimated size %d > max-size %d; increase max-size or reduce flow-count/packets-per-flow", estimatedSize, cfg.MaxSizeBytes)
+	baseSize := 24 + totalPackets*78
+	payloadExtra := 0
+	if exactBytes > 0 {
+		if exactBytes < baseSize {
+			return fmt.Errorf("exact-size %d < base size %d; increase exact-size or reduce flow-count/packets-per-flow", exactBytes, baseSize)
+		}
+		payloadExtra = exactBytes - baseSize
+	} else if cfg.MaxSizeBytes > 0 && baseSize > cfg.MaxSizeBytes {
+		return fmt.Errorf("estimated size %d > max-size %d; increase max-size or reduce flow-count/packets-per-flow", baseSize, cfg.MaxSizeBytes)
 	}
 
 	if duration <= 0 {
@@ -175,7 +194,12 @@ func createPcapFileFlows(path string, start time.Time, duration time.Duration, c
 			offsetUsec := packetIdx * usecStep
 			packetIdx++
 			packetTime := start.Add(time.Duration(offsetUsec) * time.Microsecond)
-			packetData, err := createPacketForHosts(internal[internalIdx], external[externalIdx], internalAsSource)
+			lastPacket := flowIdx == cfg.FlowCount-1 && p == cfg.PacketsPerFlow-1
+			payloadLen := 0
+			if lastPacket && payloadExtra > 0 {
+				payloadLen = payloadExtra
+			}
+			packetData, err := createPacketForHosts(randSrc, internal[internalIdx], external[externalIdx], internalAsSource, payloadLen)
 			if err != nil {
 				return err
 			}
@@ -196,7 +220,7 @@ func createPcapFileFlows(path string, start time.Time, duration time.Duration, c
 	return nil
 }
 
-func createPcapFile(path string, start time.Time, duration time.Duration, maxSize int, randSrc *rand.Rand, internal, external []host) error {
+func createPcapFile(path string, start time.Time, duration time.Duration, maxSize int, exactBytes int, randSrc *rand.Rand, internal, external []host) error {
 	log.Printf("Creating %s duration=%s", path, duration)
 
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -211,6 +235,65 @@ func createPcapFile(path string, start time.Time, duration time.Duration, maxSiz
 	writer := pcapgo.NewWriter(f)
 	if err := writer.WriteFileHeader(65535, layers.LinkTypeEthernet); err != nil {
 		return err
+	}
+
+	if exactBytes > 0 {
+		const (
+			sizeFileHeader       = 24
+			sizePacketPlusHeader = 78
+		)
+		if exactBytes < sizeFileHeader+sizePacketPlusHeader {
+			return errors.New("exact-size too small for packet generation")
+		}
+		totalPackets := (exactBytes - sizeFileHeader) / sizePacketPlusHeader
+		remainder := (exactBytes - sizeFileHeader) % sizePacketPlusHeader
+		if totalPackets <= 0 {
+			return errors.New("exact-size too small for packet generation")
+		}
+
+		startSec := start.Unix()
+		endSec := startSec + int64(duration.Seconds()) - 1
+		offsetUsec := 0
+
+		for i := 0; i < totalPackets; i++ {
+			if i%100000 == 0 {
+				log.Printf("Creating packet %d", i)
+			}
+
+			packetTime := time.Unix(startSec, int64(offsetUsec)*1000)
+			payloadLen := 0
+			if i == totalPackets-1 && remainder > 0 {
+				payloadLen = remainder
+			}
+			packetData, err := createPacket(randSrc, internal, external, payloadLen)
+			if err != nil {
+				return err
+			}
+			ci := gopacket.CaptureInfo{
+				Timestamp:     packetTime,
+				CaptureLength: len(packetData),
+				Length:        len(packetData),
+			}
+			if err := writer.WritePacket(ci, packetData); err != nil {
+				return err
+			}
+
+			remaining := float64(endSec - int64(startSec))
+			if remaining <= 0 {
+				remaining = 1
+			}
+			interPacket := int((remaining / float64(totalPackets-i)) * 1_000_000)
+			if interPacket < 1 {
+				interPacket = 1
+			}
+			offsetUsec += randSrc.Intn(interPacket + 1)
+			if offsetUsec >= 1_000_000 {
+				startSec++
+				offsetUsec -= 1_000_000
+			}
+		}
+
+		return nil
 	}
 
 	sizeFileHeader := 24
@@ -230,7 +313,7 @@ func createPcapFile(path string, start time.Time, duration time.Duration, maxSiz
 		}
 
 		packetTime := time.Unix(startSec, int64(offsetUsec)*1000)
-		packetData, err := createPacket(randSrc, internal, external)
+		packetData, err := createPacket(randSrc, internal, external, 0)
 		if err != nil {
 			return err
 		}
@@ -261,7 +344,7 @@ func createPcapFile(path string, start time.Time, duration time.Duration, maxSiz
 	return nil
 }
 
-func createPacket(randSrc *rand.Rand, internal, external []host) ([]byte, error) {
+func createPacket(randSrc *rand.Rand, internal, external []host, payloadLen int) ([]byte, error) {
 	internalAsSource := randSrc.Intn(2) == 1
 	var src, dst host
 	if internalAsSource {
@@ -317,8 +400,18 @@ func createPacket(randSrc *rand.Rand, internal, external []host) ([]byte, error)
 
 	buf := gopacket.NewSerializeBuffer()
 	opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
-	if err := gopacket.SerializeLayers(buf, opts, &eth, &ip, &tcp); err != nil {
-		return nil, err
+	if payloadLen > 0 {
+		payload := make([]byte, payloadLen)
+		if _, err := randSrc.Read(payload); err != nil {
+			return nil, err
+		}
+		if err := gopacket.SerializeLayers(buf, opts, &eth, &ip, &tcp, gopacket.Payload(payload)); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := gopacket.SerializeLayers(buf, opts, &eth, &ip, &tcp); err != nil {
+			return nil, err
+		}
 	}
 	return buf.Bytes(), nil
 }
@@ -332,7 +425,7 @@ func flowIndexToHosts(idx, internalCount, externalCount int) (int, int, bool) {
 	return idx / externalCount, idx % externalCount, false
 }
 
-func createPacketForHosts(internalHost, externalHost host, internalAsSource bool) ([]byte, error) {
+func createPacketForHosts(randSrc *rand.Rand, internalHost, externalHost host, internalAsSource bool, payloadLen int) ([]byte, error) {
 	var src, dst host
 	if internalAsSource {
 		src = internalHost
@@ -387,8 +480,18 @@ func createPacketForHosts(internalHost, externalHost host, internalAsSource bool
 
 	buf := gopacket.NewSerializeBuffer()
 	opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
-	if err := gopacket.SerializeLayers(buf, opts, &eth, &ip, &tcp); err != nil {
-		return nil, err
+	if payloadLen > 0 {
+		payload := make([]byte, payloadLen)
+		if _, err := randSrc.Read(payload); err != nil {
+			return nil, err
+		}
+		if err := gopacket.SerializeLayers(buf, opts, &eth, &ip, &tcp, gopacket.Payload(payload)); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := gopacket.SerializeLayers(buf, opts, &eth, &ip, &tcp); err != nil {
+			return nil, err
+		}
 	}
 	return buf.Bytes(), nil
 }

@@ -4,7 +4,10 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"genflux/internal/pcapgen"
@@ -67,8 +70,9 @@ func pcapGen(args []string) {
 	maxDur := fs.Int("max-duration", int(cfg.MaxDuration.Seconds()), "max duration seconds")
 	fileCount := fs.Int("file-count", cfg.FileCount, "number of files to generate")
 	outDir := fs.String("out-dir", cfg.OutDir, "output directory")
+	outFile := fs.String("out-file", cfg.OutFile, "output file path (requires file-count=1)")
 	startTime := fs.String("start-time", cfg.StartTime.Format("Mon Jan 2 15:04:05 2006"), "start time (Mon Jan 2 15:04:05 2006 or RFC3339)")
-	maxSize := fs.Int("max-size", cfg.MaxSizeBytes, "max size in bytes for each file")
+	exactSize := fs.String("exact-size", "", "exact total file size with unit (e.g. 1g, 0.5gb, 1024m; uses 1024-based units)")
 	seed := fs.Int64("seed", cfg.Seed, "random seed (int64)")
 	flowCount := fs.Int("flow-count", cfg.FlowCount, "number of unique 5-tuples to generate (0=disabled)")
 	packetsPerFlow := fs.Int("packets-per-flow", cfg.PacketsPerFlow, "packets per 5-tuple when flow-count is set")
@@ -85,11 +89,24 @@ func pcapGen(args []string) {
 	cfg.MaxDuration = time.Duration(*maxDur) * time.Second
 	cfg.FileCount = *fileCount
 	cfg.OutDir = *outDir
+	cfg.OutFile = *outFile
 	cfg.StartTime = parsedStart
-	cfg.MaxSizeBytes = *maxSize
 	cfg.Seed = *seed
 	cfg.FlowCount = *flowCount
 	cfg.PacketsPerFlow = *packetsPerFlow
+	if *exactSize != "" {
+		size, err := parseSize(*exactSize)
+		if err != nil {
+			log.Fatalf("invalid exact-size: %v", err)
+		}
+		if size > math.MaxInt {
+			log.Fatalf("exact-size too large: %d", size)
+		}
+		cfg.ExactBytes = int(size)
+	}
+	if cfg.ExactBytes <= 0 {
+		log.Fatal("exact-size is required")
+	}
 
 	if err := pcapgen.Generate(cfg); err != nil {
 		log.Fatal(err)
@@ -131,4 +148,56 @@ func parseTime(value string) (time.Time, error) {
 		return t, nil
 	}
 	return time.ParseInLocation("Mon Jan 2 15:04:05 2006", value, time.Local)
+}
+
+func parseSize(value string) (int64, error) {
+	v := strings.TrimSpace(strings.ToLower(value))
+	if v == "" {
+		return 0, fmt.Errorf("empty size")
+	}
+
+	mult := int64(1)
+	switch {
+	case strings.HasSuffix(v, "tib"):
+		mult = 1024 * 1024 * 1024 * 1024
+		v = strings.TrimSuffix(v, "tib")
+	case strings.HasSuffix(v, "tb"), strings.HasSuffix(v, "t"):
+		mult = 1024 * 1024 * 1024 * 1024
+		v = strings.TrimSuffix(strings.TrimSuffix(v, "tb"), "t")
+	case strings.HasSuffix(v, "gib"):
+		mult = 1024 * 1024 * 1024
+		v = strings.TrimSuffix(v, "gib")
+	case strings.HasSuffix(v, "gb"), strings.HasSuffix(v, "g"):
+		mult = 1024 * 1024 * 1024
+		v = strings.TrimSuffix(strings.TrimSuffix(v, "gb"), "g")
+	case strings.HasSuffix(v, "mib"):
+		mult = 1024 * 1024
+		v = strings.TrimSuffix(v, "mib")
+	case strings.HasSuffix(v, "mb"), strings.HasSuffix(v, "m"):
+		mult = 1024 * 1024
+		v = strings.TrimSuffix(strings.TrimSuffix(v, "mb"), "m")
+	case strings.HasSuffix(v, "kib"):
+		mult = 1024
+		v = strings.TrimSuffix(v, "kib")
+	case strings.HasSuffix(v, "kb"), strings.HasSuffix(v, "k"):
+		mult = 1024
+		v = strings.TrimSuffix(strings.TrimSuffix(v, "kb"), "k")
+	case strings.HasSuffix(v, "b"):
+		mult = 1
+		v = strings.TrimSuffix(v, "b")
+	}
+
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0, fmt.Errorf("missing numeric value")
+	}
+
+	num, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return 0, err
+	}
+	if num <= 0 {
+		return 0, fmt.Errorf("size must be > 0")
+	}
+	return int64(math.Round(num * float64(mult))), nil
 }
