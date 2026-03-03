@@ -86,6 +86,70 @@ sudo ./genflux replay --in generated_0000.pcap --iface eth0 --mode mbps --mbps 2
 - `--start-time`：开始时间（RFC3339 或 `Mon Jan 2 15:04:05 2006`）。
 - `--exact-size`：精确输出到指定大小（如 `1g`、`0.5gb`；1024 进制，要求 `--file-count 1`）。
 - `--seed`：随机种子（int64），用于复现实验结果。
+- `--proto-dist`：协议占比（如 `tcp=70,udp=25,icmp=5`）。
+- `--tcp-port-dist`：TCP 目的端口分布（如 `443=40,80=20,1024-65535=10`）。
+- `--udp-port-dist`：UDP 目的端口分布（如 `53=30,443=25,1024-65535=10`）。
+- `--pkt-size-dist`：包长分布（字节，L2 帧长），如 `64=25,128=15,512=15,1500=20`。
+- `--resp-ratio`：请求/响应比例中的“响应占比”（0~1，默认 0.35）。
+
+默认“真实感”分布（不传上述参数时生效）：
+- 协议：TCP 70%、UDP 25%、ICMP 5%
+- TCP 端口：以 443/80 为主，少量 22/3389/445/数据库端口与高端口
+- UDP 端口：以 53/443/123 为主，少量 3478/500/4500/1900/5353 与高端口
+- 包长：64/128/256/512/1024/1500 字节混合
+
+应用层模板（默认启用）：
+- TCP：基于端口选择 HTTP/HTTPS/SSH/RDP/SMB/DB 模板，其余为随机负载
+- UDP：基于端口选择 DNS/QUIC/NTP/STUN/IPsec/SSDP/mDNS 模板，其余为随机负载
+- ICMP：Echo Request/Reply
+
+请求/响应比例如何计算：
+- 在 `--flow-count > 0` 的流模式下，每条流会计算 `responseCount = round((packetsPerFlow-1) * respRatio)`。
+- 然后从该流的包序号 `1..packetsPerFlow-1` 中随机挑 `responseCount` 个作为响应包，其余为请求包。
+- 响应包会反向发送（源/目的主机与端口交换），并使用响应模板（如 HTTP 响应、DNS 响应）。
+
+使用示例：
+
+示例 1：默认“真实感”分布，生成 1GB pcap
+```
+./genflux pcap gen --file-count 1 --exact-size 1g --out-file ./realistic_1g.pcap
+```
+
+示例 2：流模式 + 请求/响应比例（每流 10 包，响应占比 35%）
+```
+./genflux pcap gen \
+  --flow-count 2000000 \
+  --packets-per-flow 10 \
+  --resp-ratio 0.35 \
+  --exact-size 1.5g \
+  --file-count 1 \
+  --out-file ./flows_1_5g.pcap
+```
+
+示例 3：流模式 + 30GB
+```
+./genflux pcap gen \
+  --internal-hosts 2000 \
+  --external-hosts 1000 \
+  --flow-count 3000000 \
+  --packets-per-flow 10 \
+  --resp-ratio 0.35 \
+  --exact-size 30g \
+  --file-count 1 \
+  --out-file ./flows_30g.pcap
+```
+
+示例 4：自定义协议/端口/包长分布
+```
+./genflux pcap gen \
+  --file-count 1 \
+  --exact-size 2g \
+  --out-file ./custom_2g.pcap \
+  --proto-dist "tcp=65,udp=30,icmp=5" \
+  --tcp-port-dist "443=50,80=20,22=5,1024-65535=25" \
+  --udp-port-dist "53=35,443=30,123=5,1024-65535=30" \
+  --pkt-size-dist "64=20,128=20,512=20,1024=20,1500=20"
+```
 
 ### 2) 回放 pcap（AF_PACKET）
 

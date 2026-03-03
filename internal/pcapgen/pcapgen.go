@@ -29,6 +29,11 @@ type Config struct {
 	Seed           int64
 	FlowCount      int
 	PacketsPerFlow int
+	ProtoDist      ProtoDist
+	TCPPortDist    PortDist
+	UDPPortDist    PortDist
+	PktSizeDist    SizeDist
+	ResponseRatio  float64
 }
 
 func DefaultConfig() Config {
@@ -47,6 +52,11 @@ func DefaultConfig() Config {
 		Seed:           time.Now().UnixNano(),
 		FlowCount:      0,
 		PacketsPerFlow: 2,
+		ProtoDist:      DefaultProtoDist(),
+		TCPPortDist:    DefaultTCPPortDist(),
+		UDPPortDist:    DefaultUDPPortDist(),
+		PktSizeDist:    DefaultPktSizeDist(),
+		ResponseRatio:  0.35,
 	}
 }
 
@@ -79,6 +89,9 @@ func Generate(cfg Config) error {
 	}
 	if cfg.FlowCount > 0 && cfg.PacketsPerFlow <= 0 {
 		return errors.New("packets-per-flow must be > 0 when flow-count is set")
+	}
+	if cfg.ResponseRatio < 0 || cfg.ResponseRatio > 1 {
+		return errors.New("resp-ratio must be within [0,1]")
 	}
 
 	randSrc := rand.New(rand.NewSource(cfg.Seed))
@@ -118,6 +131,8 @@ func Generate(cfg Config) error {
 			path = filepath.Join(cfg.OutDir, name)
 		}
 
+		fileSeed := mixSeed(cfg.Seed, int64(i))
+		randSrc := rand.New(rand.NewSource(fileSeed))
 		dur := randomDuration(randSrc, cfg.MinDuration, cfg.MaxDuration)
 		if cfg.FileCount > 1 {
 			next := startTime
@@ -129,11 +144,11 @@ func Generate(cfg Config) error {
 		}
 
 		if cfg.FlowCount > 0 {
-			if err := createPcapFileFlows(path, startTime, dur, cfg, cfg.ExactBytes, randSrc, internal, external); err != nil {
+			if err := createPcapFileFlows(path, startTime, dur, cfg, cfg.ExactBytes, fileSeed, internal, external); err != nil {
 				return err
 			}
 		} else {
-			if err := createPcapFile(path, startTime, dur, cfg.MaxSizeBytes, cfg.ExactBytes, randSrc, internal, external); err != nil {
+			if err := createPcapFile(path, startTime, dur, cfg, cfg.MaxSizeBytes, cfg.ExactBytes, fileSeed, internal, external); err != nil {
 				return err
 			}
 		}
@@ -142,7 +157,7 @@ func Generate(cfg Config) error {
 	return nil
 }
 
-func createPcapFileFlows(path string, start time.Time, duration time.Duration, cfg Config, exactBytes int, randSrc *rand.Rand, internal, external []host) error {
+func createPcapFileFlows(path string, start time.Time, duration time.Duration, cfg Config, exactBytes int, fileSeed int64, internal, external []host) error {
 	log.Printf("Creating %s flows=%d packetsPerFlow=%d duration=%s", path, cfg.FlowCount, cfg.PacketsPerFlow, duration)
 
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -164,13 +179,24 @@ func createPcapFileFlows(path string, start time.Time, duration time.Duration, c
 		return fmt.Errorf("flow-count exceeds capacity: flow-count=%d max=%d (2*internal*external)", cfg.FlowCount, totalCapacity)
 	}
 	totalPackets := cfg.FlowCount * cfg.PacketsPerFlow
-	baseSize := 24 + totalPackets*78
-	payloadExtra := 0
+	baseSize, totalPayload, totalCapacityBytes, minSize, err := planFlowSizing(cfg, totalPackets, fileSeed)
+	if err != nil {
+		return err
+	}
 	if exactBytes > 0 {
-		if exactBytes < baseSize {
-			return fmt.Errorf("exact-size %d < base size %d; increase exact-size or reduce flow-count/packets-per-flow", exactBytes, baseSize)
+		if exactBytes < minSize {
+			return fmt.Errorf("exact-size %d < minimum size %d; increase exact-size", exactBytes, minSize)
 		}
-		payloadExtra = exactBytes - baseSize
+		if exactBytes < baseSize {
+			// Allow shrinking payloads down to zero where possible.
+			// This keeps protocol mix while meeting smaller exact sizes.
+			// baseSize here is the planned distribution size.
+		}
+		payloadExtra := exactBytes - baseSize
+		if payloadExtra > totalCapacityBytes {
+			return fmt.Errorf("exact-size requires payloadExtra=%d but max supported is %d; increase packets-per-flow or flow-count", payloadExtra, totalCapacityBytes)
+		}
+		_ = payloadExtra
 	} else if cfg.MaxSizeBytes > 0 && baseSize > cfg.MaxSizeBytes {
 		return fmt.Errorf("estimated size %d > max-size %d; increase max-size or reduce flow-count/packets-per-flow", baseSize, cfg.MaxSizeBytes)
 	}
@@ -188,18 +214,50 @@ func createPcapFileFlows(path string, start time.Time, duration time.Duration, c
 	}
 
 	packetIdx := 0
+	remainingPackets := totalPackets
+	remainingDelta := 0
+	remainingRemove := 0
+	if exactBytes > 0 {
+		delta := exactBytes - baseSize
+		if delta >= 0 {
+			remainingDelta = delta
+		} else {
+			remainingRemove = -delta
+		}
+	}
+	remainingCapacity := totalCapacityBytes
+	remainingPayload := totalPayload
 	for flowIdx := 0; flowIdx < cfg.FlowCount; flowIdx++ {
 		internalIdx, externalIdx, internalAsSource := flowIndexToHosts(flowIdx, len(internal), len(external))
+		flowRand := rand.New(rand.NewSource(mixSeed(fileSeed, int64(flowIdx))))
+		flowPlan := planFlow(flowRand, cfg)
+		respRand := rand.New(rand.NewSource(mixSeedWithSalt(fileSeed, int64(flowIdx), 0x5bd1e995)))
+		respMask := responseMask(respRand, cfg.PacketsPerFlow, cfg.ResponseRatio)
 		for p := 0; p < cfg.PacketsPerFlow; p++ {
 			offsetUsec := packetIdx * usecStep
 			packetIdx++
 			packetTime := start.Add(time.Duration(offsetUsec) * time.Microsecond)
-			lastPacket := flowIdx == cfg.FlowCount-1 && p == cfg.PacketsPerFlow-1
-			payloadLen := 0
-			if lastPacket && payloadExtra > 0 {
-				payloadLen = payloadExtra
+			payloadLen, maxAdd, basePayload := planPayloadLen(flowRand, cfg, flowPlan.Proto)
+			adjustedPayload := payloadLen
+			if remainingDelta > 0 {
+				add := allocateDelta(remainingDelta, remainingCapacity, maxAdd, remainingPackets)
+				adjustedPayload += add
+				remainingDelta -= add
+				remainingCapacity -= maxAdd
+			} else if remainingRemove > 0 {
+				remove := allocateRemove(remainingRemove, remainingPayload, basePayload, remainingPackets)
+				adjustedPayload -= remove
+				remainingRemove -= remove
+				remainingPayload -= basePayload
 			}
-			packetData, err := createPacketForHosts(randSrc, internal[internalIdx], external[externalIdx], internalAsSource, payloadLen)
+			remainingPackets--
+			payloadRand := rand.New(rand.NewSource(mixSeed(fileSeed, int64(flowIdx)<<32|int64(p))))
+			isResponse := respMask[p]
+			effectiveInternalAsSource := internalAsSource
+			if isResponse {
+				effectiveInternalAsSource = !internalAsSource
+			}
+			packetData, err := createPacketForHosts(payloadRand, internal[internalIdx], external[externalIdx], effectiveInternalAsSource, flowPlan, isResponse, adjustedPayload)
 			if err != nil {
 				return err
 			}
@@ -216,11 +274,15 @@ func createPcapFileFlows(path string, start time.Time, duration time.Duration, c
 			log.Printf("Creating flow %d", flowIdx)
 		}
 	}
+	if remainingDelta != 0 || remainingRemove != 0 {
+		return fmt.Errorf("payload distribution bug: remainingDelta=%d remainingRemove=%d", remainingDelta, remainingRemove)
+	}
+	log.Printf("Done %s packets=%d exactBytes=%d", path, totalPackets, exactBytes)
 
 	return nil
 }
 
-func createPcapFile(path string, start time.Time, duration time.Duration, maxSize int, exactBytes int, randSrc *rand.Rand, internal, external []host) error {
+func createPcapFile(path string, start time.Time, duration time.Duration, cfg Config, maxSize int, exactBytes int, fileSeed int64, internal, external []host) error {
 	log.Printf("Creating %s duration=%s", path, duration)
 
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -246,14 +308,35 @@ func createPcapFile(path string, start time.Time, duration time.Duration, maxSiz
 			return errors.New("exact-size too small for packet generation")
 		}
 		totalPackets := (exactBytes - sizeFileHeader) / sizePacketPlusHeader
-		remainder := (exactBytes - sizeFileHeader) % sizePacketPlusHeader
 		if totalPackets <= 0 {
 			return errors.New("exact-size too small for packet generation")
+		}
+		baseSize, totalPayload, totalCapacityBytes, minSize, err := planPacketSizing(cfg, totalPackets, fileSeed)
+		if err != nil {
+			return err
+		}
+		if exactBytes < minSize {
+			return fmt.Errorf("exact-size %d < minimum size %d; increase exact-size", exactBytes, minSize)
+		}
+		payloadExtra := exactBytes - baseSize
+		if payloadExtra > totalCapacityBytes {
+			return fmt.Errorf("exact-size requires payloadExtra=%d but max supported is %d", payloadExtra, totalCapacityBytes)
 		}
 
 		startSec := start.Unix()
 		endSec := startSec + int64(duration.Seconds()) - 1
 		offsetUsec := 0
+
+		remainingPackets := totalPackets
+		remainingDelta := 0
+		remainingRemove := 0
+		if payloadExtra >= 0 {
+			remainingDelta = payloadExtra
+		} else {
+			remainingRemove = -payloadExtra
+		}
+		remainingCapacity := totalCapacityBytes
+		remainingPayload := totalPayload
 
 		for i := 0; i < totalPackets; i++ {
 			if i%100000 == 0 {
@@ -261,11 +344,26 @@ func createPcapFile(path string, start time.Time, duration time.Duration, maxSiz
 			}
 
 			packetTime := time.Unix(startSec, int64(offsetUsec)*1000)
-			payloadLen := 0
-			if i == totalPackets-1 && remainder > 0 {
-				payloadLen = remainder
+			planRand := rand.New(rand.NewSource(mixSeed(fileSeed, int64(i))))
+			packetPlan := planPacket(planRand, cfg)
+			respRand := rand.New(rand.NewSource(mixSeedWithSalt(fileSeed, int64(i), 0x5bd1e995)))
+			isResponse := respRand.Float64() < cfg.ResponseRatio
+			payloadLen, maxAdd, basePayload := planPayloadLen(planRand, cfg, packetPlan.Proto)
+			adjustedPayload := payloadLen
+			if remainingDelta > 0 {
+				add := allocateDelta(remainingDelta, remainingCapacity, maxAdd, remainingPackets)
+				adjustedPayload += add
+				remainingDelta -= add
+				remainingCapacity -= maxAdd
+			} else if remainingRemove > 0 {
+				remove := allocateRemove(remainingRemove, remainingPayload, basePayload, remainingPackets)
+				adjustedPayload -= remove
+				remainingRemove -= remove
+				remainingPayload -= basePayload
 			}
-			packetData, err := createPacket(randSrc, internal, external, payloadLen)
+			remainingPackets--
+			payloadRand := rand.New(rand.NewSource(mixSeedWithSalt(fileSeed, int64(i), 0x9e3779b97f4a7c15)))
+			packetData, err := createPacket(payloadRand, internal, external, packetPlan, isResponse, adjustedPayload)
 			if err != nil {
 				return err
 			}
@@ -286,11 +384,15 @@ func createPcapFile(path string, start time.Time, duration time.Duration, maxSiz
 			if interPacket < 1 {
 				interPacket = 1
 			}
-			offsetUsec += randSrc.Intn(interPacket + 1)
+			offsetUsec += planRand.Intn(interPacket + 1)
 			if offsetUsec >= 1_000_000 {
 				startSec++
 				offsetUsec -= 1_000_000
 			}
+		}
+
+		if remainingDelta != 0 || remainingRemove != 0 {
+			return fmt.Errorf("payload distribution bug: remainingDelta=%d remainingRemove=%d", remainingDelta, remainingRemove)
 		}
 
 		return nil
@@ -313,7 +415,13 @@ func createPcapFile(path string, start time.Time, duration time.Duration, maxSiz
 		}
 
 		packetTime := time.Unix(startSec, int64(offsetUsec)*1000)
-		packetData, err := createPacket(randSrc, internal, external, 0)
+		planRand := rand.New(rand.NewSource(mixSeed(fileSeed, int64(i))))
+		packetPlan := planPacket(planRand, cfg)
+		respRand := rand.New(rand.NewSource(mixSeedWithSalt(fileSeed, int64(i), 0x5bd1e995)))
+		isResponse := respRand.Float64() < cfg.ResponseRatio
+		payloadRand := rand.New(rand.NewSource(mixSeedWithSalt(fileSeed, int64(i), 0x9e3779b97f4a7c15)))
+		payloadLen, _, _ := planPayloadLen(planRand, cfg, packetPlan.Proto)
+		packetData, err := createPacket(payloadRand, internal, external, packetPlan, isResponse, payloadLen)
 		if err != nil {
 			return err
 		}
@@ -334,7 +442,7 @@ func createPcapFile(path string, start time.Time, duration time.Duration, maxSiz
 		if interPacket < 1 {
 			interPacket = 1
 		}
-		offsetUsec += randSrc.Intn(interPacket + 1)
+		offsetUsec += planRand.Intn(interPacket + 1)
 		if offsetUsec >= 1_000_000 {
 			startSec++
 			offsetUsec -= 1_000_000
@@ -344,7 +452,7 @@ func createPcapFile(path string, start time.Time, duration time.Duration, maxSiz
 	return nil
 }
 
-func createPacket(randSrc *rand.Rand, internal, external []host, payloadLen int) ([]byte, error) {
+func createPacket(randSrc *rand.Rand, internal, external []host, plan PacketPlan, isResponse bool, payloadLen int) ([]byte, error) {
 	internalAsSource := randSrc.Intn(2) == 1
 	var src, dst host
 	if internalAsSource {
@@ -354,66 +462,7 @@ func createPacket(randSrc *rand.Rand, internal, external []host, payloadLen int)
 		src = external[randSrc.Intn(len(external))]
 		dst = internal[randSrc.Intn(len(internal))]
 	}
-
-	eth := layers.Ethernet{
-		SrcMAC:       src.mac,
-		DstMAC:       dst.mac,
-		EthernetType: layers.EthernetTypeIPv4,
-	}
-
-	ip := layers.IPv4{
-		Version:  4,
-		IHL:      5,
-		TTL:      128,
-		Protocol: layers.IPProtocolTCP,
-		SrcIP:    src.ip,
-		DstIP:    dst.ip,
-	}
-
-	tcp := layers.TCP{
-		SrcPort:    3372,
-		DstPort:    80,
-		Seq:        0x38affe13,
-		Ack:        0,
-		Window:     8760,
-		FIN:        false,
-		SYN:        true,
-		RST:        false,
-		PSH:        false,
-		ACK:        false,
-		URG:        false,
-		ECE:        false,
-		CWR:        false,
-		NS:         false,
-		DataOffset: 7,
-		Options: []layers.TCPOption{
-			{OptionType: layers.TCPOptionKindMSS, OptionLength: 4, OptionData: []byte{0x05, 0xB4}},
-			{OptionType: layers.TCPOptionKindNop},
-			{OptionType: layers.TCPOptionKindNop},
-			{OptionType: layers.TCPOptionKindSACKPermitted, OptionLength: 2},
-		},
-	}
-
-	if err := tcp.SetNetworkLayerForChecksum(&ip); err != nil {
-		return nil, err
-	}
-
-	buf := gopacket.NewSerializeBuffer()
-	opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
-	if payloadLen > 0 {
-		payload := make([]byte, payloadLen)
-		if _, err := randSrc.Read(payload); err != nil {
-			return nil, err
-		}
-		if err := gopacket.SerializeLayers(buf, opts, &eth, &ip, &tcp, gopacket.Payload(payload)); err != nil {
-			return nil, err
-		}
-	} else {
-		if err := gopacket.SerializeLayers(buf, opts, &eth, &ip, &tcp); err != nil {
-			return nil, err
-		}
-	}
-	return buf.Bytes(), nil
+	return buildPacket(randSrc, src, dst, plan, isResponse, payloadLen)
 }
 
 func flowIndexToHosts(idx, internalCount, externalCount int) (int, int, bool) {
@@ -425,7 +474,7 @@ func flowIndexToHosts(idx, internalCount, externalCount int) (int, int, bool) {
 	return idx / externalCount, idx % externalCount, false
 }
 
-func createPacketForHosts(randSrc *rand.Rand, internalHost, externalHost host, internalAsSource bool, payloadLen int) ([]byte, error) {
+func createPacketForHosts(randSrc *rand.Rand, internalHost, externalHost host, internalAsSource bool, plan PacketPlan, isResponse bool, payloadLen int) ([]byte, error) {
 	var src, dst host
 	if internalAsSource {
 		src = internalHost
@@ -434,7 +483,10 @@ func createPacketForHosts(randSrc *rand.Rand, internalHost, externalHost host, i
 		src = externalHost
 		dst = internalHost
 	}
+	return buildPacket(randSrc, src, dst, plan, isResponse, payloadLen)
+}
 
+func buildPacket(randSrc *rand.Rand, src host, dst host, plan PacketPlan, isResponse bool, payloadLen int) ([]byte, error) {
 	eth := layers.Ethernet{
 		SrcMAC:       src.mac,
 		DstMAC:       dst.mac,
@@ -445,52 +497,109 @@ func createPacketForHosts(randSrc *rand.Rand, internalHost, externalHost host, i
 		Version:  4,
 		IHL:      5,
 		TTL:      128,
-		Protocol: layers.IPProtocolTCP,
+		Protocol: plan.Proto,
 		SrcIP:    src.ip,
 		DstIP:    dst.ip,
 	}
 
-	tcp := layers.TCP{
-		SrcPort:    3372,
-		DstPort:    80,
-		Seq:        0x38affe13,
-		Ack:        0,
-		Window:     8760,
-		FIN:        false,
-		SYN:        true,
-		RST:        false,
-		PSH:        false,
-		ACK:        false,
-		URG:        false,
-		ECE:        false,
-		CWR:        false,
-		NS:         false,
-		DataOffset: 7,
-		Options: []layers.TCPOption{
-			{OptionType: layers.TCPOptionKindMSS, OptionLength: 4, OptionData: []byte{0x05, 0xB4}},
-			{OptionType: layers.TCPOptionKindNop},
-			{OptionType: layers.TCPOptionKindNop},
-			{OptionType: layers.TCPOptionKindSACKPermitted, OptionLength: 2},
-		},
-	}
-
-	if err := tcp.SetNetworkLayerForChecksum(&ip); err != nil {
-		return nil, err
-	}
-
 	buf := gopacket.NewSerializeBuffer()
 	opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
+	payload := []byte(nil)
 	if payloadLen > 0 {
-		payload := make([]byte, payloadLen)
-		if _, err := randSrc.Read(payload); err != nil {
+		payload = buildAppPayload(randSrc, plan, isResponse, payloadLen)
+		if len(payload) == 0 {
+			payload = make([]byte, payloadLen)
+			if _, err := randSrc.Read(payload); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	switch plan.Proto {
+	case layers.IPProtocolUDP:
+		srcPort, dstPort := plan.SrcPort, plan.DstPort
+		if isResponse {
+			srcPort, dstPort = dstPort, srcPort
+		}
+		udp := layers.UDP{
+			SrcPort: layers.UDPPort(srcPort),
+			DstPort: layers.UDPPort(dstPort),
+		}
+		if err := udp.SetNetworkLayerForChecksum(&ip); err != nil {
 			return nil, err
 		}
-		if err := gopacket.SerializeLayers(buf, opts, &eth, &ip, &tcp, gopacket.Payload(payload)); err != nil {
+		if payloadLen > 0 {
+			if err := gopacket.SerializeLayers(buf, opts, &eth, &ip, &udp, gopacket.Payload(payload)); err != nil {
+				return nil, err
+			}
+		} else {
+			if err := gopacket.SerializeLayers(buf, opts, &eth, &ip, &udp); err != nil {
+				return nil, err
+			}
+		}
+	case layers.IPProtocolICMPv4:
+		icmpType := plan.ICMPType
+		icmpCode := plan.ICMPCode
+		if isResponse && icmpType == layers.ICMPv4TypeEchoRequest {
+			icmpType = layers.ICMPv4TypeEchoReply
+			icmpCode = 0
+		}
+		icmp := layers.ICMPv4{
+			TypeCode: layers.CreateICMPv4TypeCode(icmpType, icmpCode),
+			Id:       uint16(randSrc.Intn(65535)),
+			Seq:      uint16(randSrc.Intn(65535)),
+		}
+		if payloadLen > 0 {
+			if err := gopacket.SerializeLayers(buf, opts, &eth, &ip, &icmp, gopacket.Payload(payload)); err != nil {
+				return nil, err
+			}
+		} else {
+			if err := gopacket.SerializeLayers(buf, opts, &eth, &ip, &icmp); err != nil {
+				return nil, err
+			}
+		}
+	case layers.IPProtocolTCP:
+		fallthrough
+	default:
+		srcPort, dstPort := plan.SrcPort, plan.DstPort
+		if isResponse {
+			srcPort, dstPort = dstPort, srcPort
+		}
+		flags := pickTCPFlags(randSrc, isResponse, payloadLen)
+		tcp := layers.TCP{
+			SrcPort:    layers.TCPPort(srcPort),
+			DstPort:    layers.TCPPort(dstPort),
+			Seq:        randSrc.Uint32(),
+			Ack:        0,
+			Window:     8760,
+			FIN:        flags.FIN,
+			SYN:        flags.SYN,
+			RST:        flags.RST,
+			PSH:        flags.PSH,
+			ACK:        flags.ACK,
+			URG:        false,
+			ECE:        false,
+			CWR:        false,
+			NS:         false,
+			DataOffset: 7,
+			Options: []layers.TCPOption{
+				{OptionType: layers.TCPOptionKindMSS, OptionLength: 4, OptionData: []byte{0x05, 0xB4}},
+				{OptionType: layers.TCPOptionKindNop},
+				{OptionType: layers.TCPOptionKindNop},
+				{OptionType: layers.TCPOptionKindSACKPermitted, OptionLength: 2},
+			},
+		}
+		if err := tcp.SetNetworkLayerForChecksum(&ip); err != nil {
 			return nil, err
 		}
-	} else {
-		if err := gopacket.SerializeLayers(buf, opts, &eth, &ip, &tcp); err != nil {
-			return nil, err
+		if payloadLen > 0 {
+			if err := gopacket.SerializeLayers(buf, opts, &eth, &ip, &tcp, gopacket.Payload(payload)); err != nil {
+				return nil, err
+			}
+		} else {
+			if err := gopacket.SerializeLayers(buf, opts, &eth, &ip, &tcp); err != nil {
+				return nil, err
+			}
 		}
 	}
 	return buf.Bytes(), nil

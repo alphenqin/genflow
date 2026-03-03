@@ -76,6 +76,11 @@ func pcapGen(args []string) {
 	seed := fs.Int64("seed", cfg.Seed, "random seed (int64)")
 	flowCount := fs.Int("flow-count", cfg.FlowCount, "number of unique 5-tuples to generate (0=disabled)")
 	packetsPerFlow := fs.Int("packets-per-flow", cfg.PacketsPerFlow, "packets per 5-tuple when flow-count is set")
+	protoDist := fs.String("proto-dist", "", "protocol distribution (e.g. tcp=70,udp=25,icmp=5)")
+	tcpPortDist := fs.String("tcp-port-dist", "", "TCP dst port distribution (e.g. 443=40,80=20,1024-65535=10)")
+	udpPortDist := fs.String("udp-port-dist", "", "UDP dst port distribution (e.g. 53=30,443=25,1024-65535=10)")
+	pktSizeDist := fs.String("pkt-size-dist", "", "packet size distribution in bytes (e.g. 64=25,128=15,512=15,1500=20)")
+	respRatio := fs.Float64("resp-ratio", cfg.ResponseRatio, "response packet ratio within a flow [0..1]")
 	_ = fs.Parse(args)
 
 	parsedStart, err := parseTime(*startTime)
@@ -94,6 +99,7 @@ func pcapGen(args []string) {
 	cfg.Seed = *seed
 	cfg.FlowCount = *flowCount
 	cfg.PacketsPerFlow = *packetsPerFlow
+	cfg.ResponseRatio = *respRatio
 	if *exactSize != "" {
 		size, err := parseSize(*exactSize)
 		if err != nil {
@@ -106,6 +112,34 @@ func pcapGen(args []string) {
 	}
 	if cfg.ExactBytes <= 0 {
 		log.Fatal("exact-size is required")
+	}
+	if *protoDist != "" {
+		dist, err := pcapgen.ParseProtoDist(*protoDist)
+		if err != nil {
+			log.Fatalf("invalid proto-dist: %v", err)
+		}
+		cfg.ProtoDist = dist
+	}
+	if *tcpPortDist != "" {
+		dist, err := pcapgen.ParsePortDist(*tcpPortDist)
+		if err != nil {
+			log.Fatalf("invalid tcp-port-dist: %v", err)
+		}
+		cfg.TCPPortDist = dist
+	}
+	if *udpPortDist != "" {
+		dist, err := pcapgen.ParsePortDist(*udpPortDist)
+		if err != nil {
+			log.Fatalf("invalid udp-port-dist: %v", err)
+		}
+		cfg.UDPPortDist = dist
+	}
+	if *pktSizeDist != "" {
+		dist, err := pcapgen.ParseSizeDist(*pktSizeDist)
+		if err != nil {
+			log.Fatalf("invalid pkt-size-dist: %v", err)
+		}
+		cfg.PktSizeDist = dist
 	}
 
 	if err := pcapgen.Generate(cfg); err != nil {
